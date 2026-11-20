@@ -1,0 +1,14 @@
+[Unit]
+Description=Xray client daemon
+Documentation=https://github.com/XTLS/Xray-core
+After=network.target
+
+[Service]
+Type=dbus
+BusName=io.github.xrayclient.Daemon
+ExecStart=@LIBDIR@/xray-clientd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

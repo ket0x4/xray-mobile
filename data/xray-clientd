@@ -1,0 +1,4 @@
+#!/bin/sh
+DIR=$(dirname "$(readlink -f "$0")")
+export PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m xrayclient.daemon "$@"

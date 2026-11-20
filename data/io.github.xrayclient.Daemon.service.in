@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=io.github.xrayclient.Daemon
+Exec=@LIBDIR@/xray-clientd
+User=root
+SystemdService=xray-clientd.service

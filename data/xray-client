@@ -1,0 +1,4 @@
+#!/bin/sh
+LIBDIR=$(dirname "$(readlink -f "$0")")/../lib/xray-client
+export PYTHONPATH="$LIBDIR${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m xrayclient.main "$@"

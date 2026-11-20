@@ -1,0 +1,7 @@
+[Plugin]
+Id=xray-quick-setting
+Name=Xray
+Types=quick-setting;
+Comment=Turn the Xray tunnel on or off
+Plugin=@plugins_dir@/libphosh-plugin-xray-quick-setting.so
+Icon=xray-quick-setting-symbolic

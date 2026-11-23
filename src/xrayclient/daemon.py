@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -31,6 +32,14 @@ LOG_PATH = os.path.join(RUN_DIR, "xray.log")
 RESOLV_BACKUP = os.path.join(RUN_DIR, "resolv.conf.bak")
 RESOLV_MARKER = os.path.join(RUN_DIR, "resolv.written")
 RESOLV_PATH = "/etc/resolv.conf"
+SYSCTL_NET = "/proc/sys/net"
+
+RESOLVE_NAME = "org.freedesktop.resolve1"
+RESOLVE_PATH = "/org/freedesktop/resolve1"
+RESOLVE_IFACE = "org.freedesktop.resolve1.Manager"
+
+AUTOCONNECT_INTERVAL = 10
+AUTOCONNECT_ATTEMPTS = 30
 
 XML = f"""
 <node>
@@ -229,6 +238,87 @@ class Daemon:
             pass
         self._restore_dns()
 
+    def _revert_tunnel_dns(self) -> None:
+        """Revert the resolver settings Xray attached to the TUN link.
+
+        Xray points resolvectl at the tunnel gateway while it runs. If it is
+        killed before reverting (SIGKILL, crash, power loss) the resolver keeps
+        that gateway in its global scope, so lookups stall against an address
+        that no longer answers. The link has to be reverted while it still
+        exists: once xray0 is gone there is no link left to revert.
+        """
+        try:
+            ifindex = socket.if_nametoindex(model.TUN_NAME)
+        except OSError:
+            return
+        if not ifindex:
+            return
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            bus.call_sync(
+                RESOLVE_NAME, RESOLVE_PATH, RESOLVE_IFACE, "RevertLink",
+                GLib.Variant("(i)", (ifindex,)),
+                GLib.VariantType.new("()"), Gio.DBusCallFlags.NONE, 2000, None,
+            )
+        except GLib.Error as exc:
+            print(f"xray-client: cannot revert tunnel DNS: {exc}", file=sys.stderr, flush=True)
+
+    def _ensure_tunnel_forwarding(self) -> None:
+        """Keep the forwarding gate open on the tunnel interface.
+
+        The kernel only forwards a packet when the interface it arrived on has
+        forwarding enabled. Replies for hotspot clients arrive on the Xray TUN,
+        which nothing else knows about, so with that gate shut clients get an
+        address and DNS but never reach the internet. NetworkManager opens the
+        gate on the AP interface itself; opening the one on the tunnel is this
+        daemon's job.
+        """
+        path = f"{SYSCTL_NET}/ipv4/conf/{model.TUN_NAME}/forwarding"
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                if handle.read().strip() == "1":
+                    return
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("1")
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            print(f"xray-client: cannot enable forwarding on {model.TUN_NAME}: {exc}",
+                  file=sys.stderr, flush=True)
+            return
+
+    def _network_ready(self) -> bool:
+        """True once any NetworkManager connection is fully activated.
+
+        Deliberately not based on the Connectivity property: NetworkManager runs
+        its own connectivity check over DNS and HTTP, so a resolver still pointing
+        at the dead tunnel gateway would report "none" forever and autoconnect
+        would never fire.
+        """
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            reply = bus.call_sync(
+                "org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager",
+                "org.freedesktop.DBus.Properties", "Get",
+                GLib.Variant("(ss)", ("org.freedesktop.NetworkManager", "ActiveConnections")),
+                GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 2000, None,
+            )
+            for path in reply.unpack()[0]:
+                if not path or path == "/":
+                    continue
+                state = bus.call_sync(
+                    "org.freedesktop.NetworkManager", path,
+                    "org.freedesktop.DBus.Properties", "Get",
+                    GLib.Variant("(ss)", ("org.freedesktop.NetworkManager.Connection.Active",
+                                          "State")),
+                    GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 2000, None,
+                ).unpack()[0]
+                if int(state) == 2:  # NM_ACTIVE_CONNECTION_STATE_ACTIVATED
+                    return True
+        except (GLib.Error, TypeError, ValueError):
+            return False
+        return False
+
     # -- xray -------------------------------------------------------------
 
     def _xray_version(self) -> str:
@@ -255,6 +345,7 @@ class Daemon:
         if process is None:
             return
         if process.poll() is None:
+            self._revert_tunnel_dns()
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -288,6 +379,7 @@ class Daemon:
         try:
             self._write_runtime_config(profile)
         except (OSError, ValueError) as exc:
+            self._set_state("error", profile, str(exc))
             return False, str(exc)
 
         self._kill_process()
@@ -306,6 +398,7 @@ class Daemon:
             return False
         code = self.process.poll()
         if code is None:
+            self._ensure_tunnel_forwarding()
             self._apply_dns()
             self._set_state("on", model.find_profile(self.config))
             self._poll_timer = GLib.timeout_add_seconds(2, self._poll)
@@ -319,6 +412,7 @@ class Daemon:
             return False
         code = self.process.poll()
         if code is None:
+            self._ensure_tunnel_forwarding()
             return True
         self._poll_timer = 0
         self._fail_from_log(code)
@@ -380,7 +474,7 @@ class Daemon:
         if incoming["active"]:
             profile = model.find_profile(incoming)
             try:
-                model.build_xray_config(incoming, profile)
+                model.build_xray_config(incoming, profile, resolve=False)
             except ValueError as exc:
                 return False, str(exc)
             if self.xray:
@@ -466,7 +560,7 @@ class Daemon:
         Gio.bus_own_name(Gio.BusType.SYSTEM, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
                          self._on_bus, None, None)
         if self.config["settings"]["connect_on_boot"] and self.config["active"]:
-            GLib.timeout_add_seconds(5, self._autoconnect)
+            GLib.timeout_add_seconds(5, self._autoconnect, 0)
         self.loop.run()
         return 0
 
@@ -475,10 +569,19 @@ class Daemon:
         self.loop.quit()
         return GLib.SOURCE_REMOVE
 
-    def _autoconnect(self) -> bool:
-        if self.state == "off" and self.config["active"]:
+    def _autoconnect(self, attempt: int) -> bool:
+        if self.state != "off" or not self.config["active"]:
+            return GLib.SOURCE_REMOVE
+        if self._network_ready():
             self.connect()
-        return False
+            return GLib.SOURCE_REMOVE
+        if attempt >= AUTOCONNECT_ATTEMPTS:
+            self._set_state(
+                "error", model.find_profile(self.config),
+                "Cannot resolve the server. Connect to a network first.")
+            return GLib.SOURCE_REMOVE
+        GLib.timeout_add_seconds(AUTOCONNECT_INTERVAL, self._autoconnect, attempt + 1)
+        return GLib.SOURCE_REMOVE
 
 
 def main() -> int:

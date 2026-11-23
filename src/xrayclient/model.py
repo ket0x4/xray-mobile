@@ -142,15 +142,24 @@ def _is_ip(value: str) -> bool:
     return False
 
 
+class ResolveError(ValueError):
+    """The proxy server address could not be turned into an IP address."""
+
+
 def resolve_server(profile: dict) -> dict:
-    """Replace the server name with an address so Xray never needs DNS to reach it."""
+    """Replace the server name with an address so Xray never needs DNS to reach it.
+
+    Xray resolves its DNS outbound through the proxy itself, so leaving a domain
+    name here makes the first connection depend on a tunnel that needs that very
+    name to come up. Failing loudly beats silently handing Xray a domain.
+    """
     server = profile.get("server", "").strip()
     if not server or _is_ip(server):
         return profile
     try:
         infos = socket.getaddrinfo(server, profile["port"], type=socket.SOCK_STREAM)
-    except OSError:
-        return profile
+    except OSError as exc:
+        raise ResolveError(f"Cannot resolve {server}: {exc}") from exc
     for family in (socket.AF_INET, socket.AF_INET6):
         for info in infos:
             if info[0] == family:
@@ -159,7 +168,7 @@ def resolve_server(profile: dict) -> dict:
                 if not resolved.get("server_name"):
                     resolved["server_name"] = server
                 return resolved
-    return profile
+    raise ResolveError(f"Cannot resolve {server}: no IPv4 or IPv6 address")
 
 
 def _dns_url(server: str) -> str:
